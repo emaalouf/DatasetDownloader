@@ -6,6 +6,7 @@ const fs = require('fs-extra');
 const path = require('path');
 const { pipeline } = require('stream');
 const { promisify } = require('util');
+const tar = require('tar');
 
 const streamPipeline = promisify(pipeline);
 
@@ -18,6 +19,13 @@ class FileDownloader {
     this.retryDelay = parseInt(process.env.RETRY_DELAY_MS) || 5000;
     this.logLevel = process.env.LOG_LEVEL || 'info';
     
+    // Unzip configuration
+    this.autoUnzip = process.env.AUTO_UNZIP === 'true';
+    this.unzipSourceDirectory = process.env.UNZIP_SOURCE_DIRECTORY || '/mnt/volume_ams3_01';
+    this.unzipDestinationDirectory = process.env.UNZIP_DESTINATION_DIRECTORY || '/mnt/volume_ams3_02';
+    this.deleteAfterUnzip = process.env.DELETE_AFTER_UNZIP === 'true';
+    this.concurrentExtractions = parseInt(process.env.CONCURRENT_EXTRACTIONS) || 2;
+    
     // Parse URLs from environment or command line arguments
     this.downloadUrls = this.parseDownloadUrls();
     
@@ -25,10 +33,17 @@ class FileDownloader {
     this.failed = 0;
     this.total = this.downloadUrls.length;
     
+    // Unzip counters
+    this.extractedFiles = 0;
+    this.failedExtractions = 0;
+    
     this.log('info', `FileDownloader initialized`);
     this.log('info', `Download directory: ${this.downloadDirectory}`);
     this.log('info', `Concurrent downloads: ${this.concurrentDownloads}`);
     this.log('info', `Total files to download: ${this.total}`);
+    if (this.autoUnzip) {
+      this.log('info', `Auto-unzip enabled: ${this.unzipSourceDirectory} -> ${this.unzipDestinationDirectory}`);
+    }
   }
 
   parseDownloadUrls() {
@@ -179,6 +194,194 @@ class FileDownloader {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  isSupportedArchive(filename) {
+    const ext = path.extname(filename).toLowerCase();
+    return ['.tgz', '.tar.gz', '.tar', '.gz'].includes(ext) || filename.endsWith('.tar.gz');
+  }
+
+  async extractTgzFile(sourceFilePath, destinationDir, attempt = 1) {
+    try {
+      const fileName = path.basename(sourceFilePath);
+      this.log('info', `Starting extraction: ${fileName} -> ${destinationDir} (attempt ${attempt})`);
+      
+      // Ensure destination directory exists
+      await fs.ensureDir(destinationDir);
+      
+      // Extract the archive
+      await tar.extract({
+        file: sourceFilePath,
+        cwd: destinationDir,
+        preservePaths: false,  // Remove leading paths for security
+        onentry: (entry) => {
+          if (entry.type === 'File' && entry.size > 1024 * 1024) { // Log files > 1MB
+            this.log('info', `Extracting: ${entry.path} (${this.formatBytes(entry.size)})`);
+          }
+        }
+      });
+      
+      // Get extracted size by checking directory
+      const stats = await this.getDirectoryStats(destinationDir);
+      
+      this.log('info', `Successfully extracted: ${fileName} (${stats.files} files, ${this.formatBytes(stats.size)})`);
+      
+      // Delete source file if configured
+      if (this.deleteAfterUnzip) {
+        await fs.remove(sourceFilePath);
+        this.log('info', `Deleted source file: ${fileName}`);
+      }
+      
+      return { 
+        success: true, 
+        fileName, 
+        sourceFilePath, 
+        destinationDir,
+        extractedFiles: stats.files,
+        extractedSize: stats.size 
+      };
+      
+    } catch (error) {
+      this.log('error', `Failed to extract ${sourceFilePath} (attempt ${attempt}): ${error.message}`);
+      
+      if (attempt < this.retryAttempts) {
+        this.log('info', `Retrying extraction in ${this.retryDelay / 1000} seconds...`);
+        await this.delay(this.retryDelay);
+        return this.extractTgzFile(sourceFilePath, destinationDir, attempt + 1);
+      } else {
+        return { success: false, error: error.message, sourceFilePath };
+      }
+    }
+  }
+
+  async getDirectoryStats(dirPath) {
+    let totalSize = 0;
+    let fileCount = 0;
+    
+    try {
+      const items = await fs.readdir(dirPath, { withFileTypes: true });
+      
+      for (const item of items) {
+        const itemPath = path.join(dirPath, item.name);
+        
+        if (item.isDirectory()) {
+          const subStats = await this.getDirectoryStats(itemPath);
+          totalSize += subStats.size;
+          fileCount += subStats.files;
+        } else if (item.isFile()) {
+          const stats = await fs.stat(itemPath);
+          totalSize += stats.size;
+          fileCount++;
+        }
+      }
+    } catch (error) {
+      this.log('warn', `Could not read directory stats for ${dirPath}: ${error.message}`);
+    }
+    
+    return { size: totalSize, files: fileCount };
+  }
+
+  async findArchiveFiles() {
+    this.log('info', `Scanning for archive files in: ${this.unzipSourceDirectory}`);
+    
+    const archiveFiles = [];
+    
+    try {
+      const files = await fs.readdir(this.unzipSourceDirectory);
+      
+      for (const file of files) {
+        const filePath = path.join(this.unzipSourceDirectory, file);
+        const stats = await fs.stat(filePath);
+        
+        if (stats.isFile() && this.isSupportedArchive(file)) {
+          archiveFiles.push({
+            path: filePath,
+            name: file,
+            size: stats.size
+          });
+        }
+      }
+    } catch (error) {
+      this.log('error', `Failed to scan source directory: ${error.message}`);
+      throw error;
+    }
+    
+    this.log('info', `Found ${archiveFiles.length} archive files to extract`);
+    return archiveFiles;
+  }
+
+  async extractAllArchives() {
+    await fs.ensureDir(this.unzipDestinationDirectory);
+    
+    const archiveFiles = await this.findArchiveFiles();
+    
+    if (archiveFiles.length === 0) {
+      this.log('info', 'No archive files found to extract');
+      return [];
+    }
+    
+    this.log('info', `Starting extraction of ${archiveFiles.length} archives with ${this.concurrentExtractions} concurrent extractions...`);
+    const startTime = Date.now();
+    
+    // Process extractions in batches
+    const results = [];
+    for (let i = 0; i < archiveFiles.length; i += this.concurrentExtractions) {
+      const batch = archiveFiles.slice(i, i + this.concurrentExtractions);
+      const batchPromises = batch.map(archive => {
+        const destDir = path.join(this.unzipDestinationDirectory, path.parse(archive.name).name);
+        return this.extractTgzFile(archive.path, destDir);
+      });
+      
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
+      
+      // Update counters
+      batchResults.forEach(result => {
+        if (result.success) {
+          this.extractedFiles++;
+        } else {
+          this.failedExtractions++;
+        }
+      });
+      
+      this.log('info', `Extraction progress: ${this.extractedFiles}/${archiveFiles.length} completed, ${this.failedExtractions} failed`);
+    }
+    
+    const endTime = Date.now();
+    const duration = ((endTime - startTime) / 1000).toFixed(2);
+    
+    // Summary
+    this.log('info', '='.repeat(50));
+    this.log('info', 'Extraction Summary:');
+    this.log('info', `Total archives: ${archiveFiles.length}`);
+    this.log('info', `Successfully extracted: ${this.extractedFiles}`);
+    this.log('info', `Failed extractions: ${this.failedExtractions}`);
+    this.log('info', `Duration: ${duration} seconds`);
+    this.log('info', `Destination directory: ${this.unzipDestinationDirectory}`);
+    
+    // Log failed extractions
+    const failedResults = results.filter(r => !r.success);
+    if (failedResults.length > 0) {
+      this.log('warn', 'Failed extractions:');
+      failedResults.forEach(result => {
+        this.log('warn', `  ${result.sourceFilePath}: ${result.error}`);
+      });
+    }
+    
+    // Calculate total extracted data
+    const totalExtractedFiles = results
+      .filter(r => r.success && r.extractedFiles)
+      .reduce((sum, r) => sum + r.extractedFiles, 0);
+    
+    const totalExtractedSize = results
+      .filter(r => r.success && r.extractedSize)
+      .reduce((sum, r) => sum + r.extractedSize, 0);
+    
+    if (totalExtractedSize > 0) {
+      this.log('info', `Total extracted: ${totalExtractedFiles} files, ${this.formatBytes(totalExtractedSize)}`);
+    }
+    
+    return results;
+  }
+
   async downloadAll() {
     await this.ensureDownloadDirectory();
     
@@ -242,13 +445,34 @@ class FileDownloader {
     try {
       this.log('info', 'FileDownloader starting...');
       
-      const results = await this.downloadAll();
+      const downloadResults = await this.downloadAll();
       
-      if (this.failed === 0) {
-        this.log('info', 'All downloads completed successfully! Exiting...');
+      // If auto-unzip is enabled, extract archives after downloading
+      let extractionResults = [];
+      if (this.autoUnzip) {
+        this.log('info', 'Starting automatic extraction of downloaded archives...');
+        extractionResults = await this.extractAllArchives();
+      }
+      
+      // Determine overall success
+      const downloadSuccess = this.failed === 0;
+      const extractionSuccess = this.failedExtractions === 0;
+      const overallSuccess = downloadSuccess && extractionSuccess;
+      
+      if (overallSuccess) {
+        this.log('info', 'All operations completed successfully! Exiting...');
+        if (this.autoUnzip && extractionResults.length > 0) {
+          this.log('info', `Downloaded ${this.completed} files and extracted ${this.extractedFiles} archives`);
+        }
         process.exit(0);
       } else {
-        this.log('error', `${this.failed} downloads failed. Exiting with error code...`);
+        if (!downloadSuccess) {
+          this.log('error', `${this.failed} downloads failed`);
+        }
+        if (!extractionSuccess) {
+          this.log('error', `${this.failedExtractions} extractions failed`);
+        }
+        this.log('error', 'Some operations failed. Exiting with error code...');
         process.exit(1);
       }
       
