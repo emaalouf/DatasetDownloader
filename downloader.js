@@ -7,6 +7,7 @@ const path = require('path');
 const { pipeline } = require('stream');
 const { promisify } = require('util');
 const tar = require('tar');
+const yauzl = require('yauzl');
 
 const streamPipeline = promisify(pipeline);
 
@@ -196,7 +197,111 @@ class FileDownloader {
 
   isSupportedArchive(filename) {
     const ext = path.extname(filename).toLowerCase();
-    return ['.tgz', '.tar.gz', '.tar', '.gz'].includes(ext) || filename.endsWith('.tar.gz');
+    return ['.tgz', '.tar.gz', '.tar', '.gz', '.zip'].includes(ext) || filename.endsWith('.tar.gz');
+  }
+
+  getArchiveType(filename) {
+    const ext = path.extname(filename).toLowerCase();
+    if (ext === '.zip') return 'zip';
+    if (['.tgz', '.tar.gz', '.tar', '.gz'].includes(ext) || filename.endsWith('.tar.gz')) return 'tar';
+    return 'unknown';
+  }
+
+  async extractZipFile(sourceFilePath, destinationDir, attempt = 1) {
+    try {
+      const fileName = path.basename(sourceFilePath);
+      this.log('info', `Starting ZIP extraction: ${fileName} -> ${destinationDir} (attempt ${attempt})`);
+      
+      // Ensure destination directory exists
+      await fs.ensureDir(destinationDir);
+      
+      return new Promise((resolve, reject) => {
+        yauzl.open(sourceFilePath, { lazyEntries: true }, (err, zipfile) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+          
+          let extractedCount = 0;
+          let totalSize = 0;
+          
+          zipfile.readEntry();
+          
+          zipfile.on('entry', (entry) => {
+            if (/\/$/.test(entry.fileName)) {
+              // Directory entry
+              const dirPath = path.join(destinationDir, entry.fileName);
+              fs.ensureDir(dirPath).then(() => {
+                zipfile.readEntry();
+              }).catch(reject);
+            } else {
+              // File entry
+              const filePath = path.join(destinationDir, entry.fileName);
+              const fileDir = path.dirname(filePath);
+              
+              // Ensure parent directory exists
+              fs.ensureDir(fileDir).then(() => {
+                zipfile.openReadStream(entry, (err, readStream) => {
+                  if (err) {
+                    reject(err);
+                    return;
+                  }
+                  
+                  const writeStream = fs.createWriteStream(filePath);
+                  readStream.pipe(writeStream);
+                  
+                  writeStream.on('close', () => {
+                    extractedCount++;
+                    totalSize += entry.uncompressedSize;
+                    
+                    if (entry.uncompressedSize > 1024 * 1024) { // Log files > 1MB
+                      this.log('info', `Extracted: ${entry.fileName} (${this.formatBytes(entry.uncompressedSize)})`);
+                    }
+                    
+                    zipfile.readEntry();
+                  });
+                  
+                  writeStream.on('error', reject);
+                  readStream.on('error', reject);
+                });
+              }).catch(reject);
+            }
+          });
+          
+          zipfile.on('end', async () => {
+            this.log('info', `Successfully extracted ZIP: ${fileName} (${extractedCount} files, ${this.formatBytes(totalSize)})`);
+            
+            // Delete source file if configured
+            if (this.deleteAfterUnzip) {
+              await fs.remove(sourceFilePath);
+              this.log('info', `Deleted source file: ${fileName}`);
+            }
+            
+            resolve({
+              success: true,
+              fileName,
+              sourceFilePath,
+              destinationDir,
+              extractedFiles: extractedCount,
+              extractedSize: totalSize
+            });
+          });
+          
+          zipfile.on('error', reject);
+        });
+      });
+      
+    } catch (error) {
+      this.log('error', `Failed to extract ZIP ${sourceFilePath} (attempt ${attempt}): ${error.message}`);
+      
+      if (attempt < this.retryAttempts) {
+        this.log('info', `Retrying ZIP extraction in ${this.retryDelay / 1000} seconds...`);
+        await this.delay(this.retryDelay);
+        return this.extractZipFile(sourceFilePath, destinationDir, attempt + 1);
+      } else {
+        return { success: false, error: error.message, sourceFilePath };
+      }
+    }
   }
 
   async extractTgzFile(sourceFilePath, destinationDir, attempt = 1) {
@@ -279,6 +384,21 @@ class FileDownloader {
     return { size: totalSize, files: fileCount };
   }
 
+  async extractFile(sourceFilePath, destinationDir) {
+    const fileName = path.basename(sourceFilePath);
+    const archiveType = this.getArchiveType(fileName);
+    
+    switch (archiveType) {
+      case 'zip':
+        return this.extractZipFile(sourceFilePath, destinationDir);
+      case 'tar':
+        return this.extractTgzFile(sourceFilePath, destinationDir);
+      default:
+        this.log('error', `Unsupported archive type for ${fileName}`);
+        return { success: false, error: `Unsupported archive type`, sourceFilePath };
+    }
+  }
+
   async findArchiveFiles() {
     this.log('info', `Scanning for archive files in: ${this.unzipSourceDirectory}`);
     
@@ -327,7 +447,7 @@ class FileDownloader {
       const batch = archiveFiles.slice(i, i + this.concurrentExtractions);
       const batchPromises = batch.map(archive => {
         const destDir = path.join(this.unzipDestinationDirectory, path.parse(archive.name).name);
-        return this.extractTgzFile(archive.path, destDir);
+        return this.extractFile(archive.path, destDir);
       });
       
       const batchResults = await Promise.all(batchPromises);
